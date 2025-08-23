@@ -1,0 +1,33 @@
+#+title: Teste Org-Mode com Múltiplas Linguagens
+
+* English Section
+** This is an English heading with special characters: åßð∂ƒ©
+** Here's some content with quotes: "Hello World" and 'Single quotes'
+
+* Seção em Português  
+** Este é um cabeçalho em português com acentos: ção, não, coração
+:PROPERTIES:
+:id: 66666666-7777-8888-9999-aaaaaaaaaaaa
+:END:
+** Conteúdo com símbolos especiais:
+*** Moedas: R$ € $ £
+*** Pontuação: ¿¡ «» „"
+
+* Русский раздел
+** Это заголовок на русском языке
+:PROPERTIES:  
+:id: bbbbbbbb-cccc-dddd-eeee-ffffffffffff
+:END:
+** Содержание с кириллицей:
+*** Символы: №₽™®©
+*** Кавычки: «русские» и "английские"
+
+* Seção Mista / Mixed Section / Смешанный раздел  
+** Referência em português para bloco russo: {{embed ((bbbbbbbb-cccc-dddd-eeee-ffffffffffff))}}
+** English reference to Portuguese block: ((66666666-7777-8888-9999-aaaaaaaaaaaa))
+** Unicode symbols: ☃ ⚡ 🌟 🚀 💎 🎯
+
+* Testes de Caracteres Especiais
+** Matemática: ∑i=1ⁿ xᵢ² = ∫₀^∞ f(x)dx  
+** Grego: αβγδεζηθικλμνξοπρστυφχψω
+** Subscrito e sobrescrito: H₂O, E=mc², x² + y² = z²
