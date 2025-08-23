@@ -20,7 +20,6 @@ function Index-Logseq-Content {
         [hashtable]$blockMap
     )
     Write-Host "--- Indexing Logseq content... ---"
-    $blockIdPattern = [regex]'(?i)^\s*id::\s*([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})'
     
     $filesToIndex = Get-ChildItem -Path $LogseqDir -Recurse -File | Where-Object { $_.Extension -in '.md', '.org' }
     
@@ -35,23 +34,120 @@ function Index-Logseq-Content {
             $pageMap[$pageName] = $file.FullName
         }
 
-        $lines = Get-Content $file.FullName -ErrorAction SilentlyContinue
-        for ($i = 0; $i -lt $lines.Length; $i++) {
-            $line = $lines[$i]
-            if (($i + 1) -lt $lines.Length) {
-                $nextLine = $lines[$i+1]
-                $match = $blockIdPattern.Match($nextLine)
-                if ($match.Success) {
-                    $blockId = $match.Groups[1].Value
-                    $blockContent = $line.TrimStart(' ', '-', '*')
-                    if (-not $blockMap.ContainsKey($blockId)) {
-                        $blockMap[$blockId] = $blockContent
-                    }
-                }
+        $content = Get-Content $file.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        if ($content) {
+            if ($file.Extension.ToLower() -eq '.org') {
+                Index-Org-Blocks -content $content -blockMap $blockMap
+            } else {
+                Index-Markdown-Blocks -content $content -blockMap $blockMap
             }
         }
     }
     Write-Host "Indexed $($pageMap.Count) pages and $($blockMap.Count) blocks."
+}
+
+function Index-Org-Blocks {
+    param(
+        [string]$content,
+        [hashtable]$blockMap
+    )
+    
+    # Split content into lines for processing
+    $lines = $content -split "`r?`n"
+    
+    for ($i = 0; $i -lt $lines.Length; $i++) {
+        $line = $lines[$i]
+        
+        # Look for :PROPERTIES: blocks that contain :id:
+        if ($line -match '^\s*:PROPERTIES:\s*$') {
+            $blockContent = ""
+            $blockId = $null
+            $startIdx = $i - 1  # The line before :PROPERTIES: is usually the content
+            
+            # Find the block ID in the properties
+            $j = $i + 1
+            while ($j -lt $lines.Length -and $lines[$j] -notmatch '^\s*:END:\s*$') {
+                if ($lines[$j] -match '^\s*:id:\s*([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\s*$') {
+                    $blockId = $matches[1]
+                    break
+                }
+                $j++
+            }
+            
+            # If we found a block ID, extract the content
+            if ($blockId -and $startIdx -ge 0) {
+                # Get the content line (usually the line before :PROPERTIES:)
+                $contentLine = $lines[$startIdx].TrimStart(' ', '*', '-').Trim()
+                
+                # For nested blocks, we might want to include child content too
+                $childContent = @()
+                $k = $j + 1  # Start after :END:
+                $baseIndent = 0
+                
+                # Calculate base indentation level for org-mode
+                if ($lines[$startIdx] -match '^(\s*\*+)') {
+                    $baseIndent = $matches[1].Length
+                }
+                
+                # Collect child content until we hit a same-level or higher-level heading
+                while ($k -lt $lines.Length) {
+                    $currentLine = $lines[$k]
+                    
+                    # Check if this is a heading line
+                    if ($currentLine -match '^\s*\*+\s+' -or $currentLine -match '^\s*:PROPERTIES:\s*$') {
+                        if ($currentLine -match '^(\s*\*+)') {
+                            $currentIndent = $matches[1].Length
+                            if ($currentIndent -le $baseIndent -and $currentLine.Trim() -ne '') {
+                                break
+                            }
+                        }
+                    }
+                    
+                    # Skip property lines and empty lines
+                    if ($currentLine.Trim() -ne '' -and 
+                        $currentLine -notmatch '^\s*:.*:\s*$' -and
+                        $currentLine -notmatch '^\s*:PROPERTIES:\s*$' -and
+                        $currentLine -notmatch '^\s*:END:\s*$') {
+                        $childContent += $currentLine.TrimStart(' ', '*', '-').Trim()
+                    }
+                    $k++
+                }
+                
+                # Combine main content with child content
+                if ($childContent.Count -gt 0) {
+                    $blockContent = $contentLine + "`n" + ($childContent -join "`n")
+                } else {
+                    $blockContent = $contentLine
+                }
+                
+                if ($blockContent.Trim() -ne '' -and -not $blockMap.ContainsKey($blockId)) {
+                    $blockMap[$blockId] = $blockContent.Trim()
+                    Write-Host "Indexed block: $blockId -> $($blockContent.Substring(0, [Math]::Min(50, $blockContent.Length)))..."
+                }
+            }
+        }
+    }
+}
+
+function Index-Markdown-Blocks {
+    param(
+        [string]$content,
+        [hashtable]$blockMap
+    )
+    
+    # Pattern for markdown block IDs (usually at end of line)
+    $blockIdPattern = [regex]'(?m)^(.*?)\s*\^\s*([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\s*$'
+    
+    $matches = $blockIdPattern.Matches($content)
+    foreach ($match in $matches) {
+        $blockId = $match.Groups[2].Value
+        $blockContent = $match.Groups[1].Value.Trim()
+        
+        if ($blockContent -ne '' -and -not $blockMap.ContainsKey($blockId)) {
+            $blockMap[$blockId] = $blockContent
+            Write-Host "Indexed block: $blockId -> $($blockContent.Substring(0, [Math]::Min(50, $blockContent.Length)))..."
+        }
+    }
 }
 
 function Resolve-LogseqPlaceholders {
@@ -59,25 +155,88 @@ function Resolve-LogseqPlaceholders {
         [string]$text,
         [hashtable]$blockMap
     )
-    $embedPattern = '\{\{embed\s+(.*?)\}\}'
-    $resolvedText = [regex]::Replace($text, $embedPattern, { param($m) $m.Groups[1].Value })
-
-    $blockRefPattern = '\(\((.*?)\)\)'
-    $maxDepth = 10
-    $currentDepth = 0
-    while (($match = [regex]::Match($resolvedText, $blockRefPattern)).Success -and $currentDepth -lt $maxDepth) {
+    
+    Write-Host "Resolving Logseq placeholders..."
+    
+    # Remove BOM if present (UTF-8 BOM is EF BB BF)
+    if ($text.StartsWith([char]0xFEFF)) {
+        $text = $text.Substring(1)
+    }
+    
+    # First, resolve embed blocks {{embed ((block-id))}}
+    $embedPattern = '\{\{embed\s+\(\(([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\)\)\}\}'
+    $resolvedText = [regex]::Replace($text, $embedPattern, {
+        param($match)
         $blockId = $match.Groups[1].Value
         if ($blockMap.ContainsKey($blockId)) {
             $replacement = $blockMap[$blockId]
+            Write-Host "Resolved embed block: $blockId -> $($replacement.Substring(0, [Math]::Min(30, $replacement.Length)))..."
+            return $replacement
+        } else {
+            Write-Warning "Embed block not found: $blockId"
+            return "**[Embed Block Not Found: $blockId]**"
+        }
+    })
+    
+    # Then resolve regular block references ((block-id))
+    $blockRefPattern = '\(\(([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\)\)'
+    $maxDepth = 10
+    $currentDepth = 0
+    
+    while ($currentDepth -lt $maxDepth) {
+        $match = [regex]::Match($resolvedText, $blockRefPattern)
+        if (-not $match.Success) {
+            break
+        }
+        
+        $blockId = $match.Groups[1].Value
+        if ($blockMap.ContainsKey($blockId)) {
+            $replacement = $blockMap[$blockId]
+            Write-Host "Resolved block reference: $blockId -> $($replacement.Substring(0, [Math]::Min(30, $replacement.Length)))..."
             $resolvedText = $resolvedText.Remove($match.Index, $match.Length).Insert($match.Index, $replacement)
         } else {
-            $resolvedText = $resolvedText.Remove($match.Index, $match.Length).Insert($match.Index, "((NOT_FOUND: $blockId))")
+            Write-Warning "Block reference not found: $blockId"
+            $resolvedText = $resolvedText.Remove($match.Index, $match.Length).Insert($match.Index, "**[Block Not Found: $blockId]**")
         }
         $currentDepth++
     }
+    
+    if ($currentDepth -eq $maxDepth) {
+        Write-Warning "Maximum recursion depth reached while resolving block references. Some references may remain unresolved."
+    }
 
+    # Handle page references [[Page Name]]
     $pageRefPattern = '\[\[([^\]]+)\]\]'
-    $resolvedText = [regex]::Replace($resolvedText, $pageRefPattern, { param($m) $m.Groups[1].Value })
+    $resolvedText = [regex]::Replace($resolvedText, $pageRefPattern, {
+        param($match)
+        $pageName = $match.Groups[1].Value
+        # Convert to a simple link format for better readability
+        return "**$pageName**"
+    })
+
+    # Handle other Logseq-specific syntax
+    # Remove or convert property blocks (but keep them single-line if they're meant to be visible)
+    $resolvedText = [regex]::Replace($resolvedText, '(?m)^\s*:PROPERTIES:.*?:END:\s*$', '', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    
+    # Handle cloze deletions {{cloze text}}
+    $resolvedText = [regex]::Replace($resolvedText, '\{\{cloze\s+(.*?)\}\}', '**$1**')
+    
+    # Clean up any remaining double embeds that might have been missed
+    $resolvedText = [regex]::Replace($resolvedText, '\{\{embed\s+(.*?)\}\}', '$1')
+    
+    # Clean up org-mode specific syntax that doesn't translate well
+    # Remove collapsed property
+    $resolvedText = [regex]::Replace($resolvedText, '(?m)^\s*:collapsed:\s*true\s*$', '')
+    
+    # Remove heading property
+    $resolvedText = [regex]::Replace($resolvedText, '(?m)^\s*:heading:\s*\d+\s*$', '')
+    
+    # Remove id property lines that might have leaked through
+    $resolvedText = [regex]::Replace($resolvedText, '(?m)^\s*:id:\s*[a-f0-9-]+\s*$', '')
+    
+    # Clean up any trailing whitespace and multiple newlines
+    $resolvedText = [regex]::Replace($resolvedText, '\n\s*\n\s*\n+', "`n`n")
+    $resolvedText = $resolvedText.Trim()
 
     return $resolvedText
 }
@@ -278,7 +437,7 @@ foreach ($file in $files) {
 
         try {
             if ($DirectoryType -eq 'Logseq') {
-                $content = Get-Content $file.FullName -Raw
+                $content = Get-Content $file.FullName -Raw -Encoding UTF8
                 $content = Resolve-LogseqPlaceholders -text $content -blockMap $blockMap
                 
                 $tmpFile = [System.IO.Path]::GetTempFileName()
@@ -300,7 +459,7 @@ foreach ($file in $files) {
                 throw "Pandoc conversion failed for $($file.Name)"
             }
             
-            $htmlContent = Get-Content $tempHtmlFile -Raw
+            $htmlContent = Get-Content $tempHtmlFile -Raw -Encoding UTF8
             Remove-Item $tempHtmlFile -Force
 
             # --- Process Images ---
