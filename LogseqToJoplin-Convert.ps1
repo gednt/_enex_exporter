@@ -4,7 +4,10 @@ param(
 
     [Parameter(Mandatory=$false)]
     [ValidateSet('Logseq', 'Other')]
-    [string]$DirectoryType = 'Logseq'
+    [string]$DirectoryType = 'Logseq',
+
+    [Parameter(Mandatory=$false)]
+    [switch]$CreateFolderStructure
 )
 
 # --- Global State ---
@@ -12,6 +15,226 @@ $pageMap = @{}
 $blockMap = @{}
 
 #region "Logseq Content Processing"
+
+function Extract-Tags-From-Content {
+    param(
+        [string]$content
+    )
+    
+    $tags = @()
+    
+    # Extract [[tag]] style tags (including hierarchical ones like [[Tag1/subtag/tag]])
+    $bracketTagPattern = '\[\[([^\]]+)\]\]'
+    $bracketMatches = [regex]::Matches($content, $bracketTagPattern)
+    foreach ($match in $bracketMatches) {
+        $tag = $match.Groups[1].Value.Trim()
+        if ($tag -and $tag -notin $tags) {
+            $tags += $tag
+        }
+    }
+    
+    # Extract #hashtag style tags (including hierarchical ones like #tag1/subtag/tag)
+    $hashtagPattern = '#([a-zA-Z0-9_/-]+)'
+    $hashtagMatches = [regex]::Matches($content, $hashtagPattern)
+    foreach ($match in $hashtagMatches) {
+        $tag = $match.Groups[1].Value.Trim()
+        if ($tag -and $tag -notin $tags) {
+            $tags += $tag
+        }
+    }
+    
+    # Extract tags from properties blocks (for org-mode and markdown)
+    $tagPropertyPattern = '(?m)^\s*#?\+?tags?::\s*(.+)$'
+    $tagPropertyMatches = [regex]::Matches($content, $tagPropertyPattern)
+    foreach ($match in $tagPropertyMatches) {
+        $tagLine = $match.Groups[1].Value
+        # Parse tags that might be in [[tag]] format
+        $tagRefs = [regex]::Matches($tagLine, '\[\[([^\]]+)\]\]')
+        foreach ($tagRef in $tagRefs) {
+            $tag = $tagRef.Groups[1].Value.Trim()
+            if ($tag -and $tag -notin $tags) {
+                $tags += $tag
+            }
+        }
+        # Also parse plain comma-separated tags
+        $plainTags = $tagLine -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '\[\[' }
+        foreach ($plainTag in $plainTags) {
+            if ($plainTag -and $plainTag -notin $tags) {
+                $tags += $plainTag
+            }
+        }
+    }
+    
+    # Extract org-mode header tags
+    $orgTagPattern = '(?m)^\s*#\+tags:\s*(.+)$'
+    $orgTagMatches = [regex]::Matches($content, $orgTagPattern)
+    foreach ($match in $orgTagMatches) {
+        $tagLine = $match.Groups[1].Value
+        $orgTags = $tagLine -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+        foreach ($orgTag in $orgTags) {
+            if ($orgTag -and $orgTag -notin $tags) {
+                $tags += $orgTag
+            }
+        }
+    }
+    
+    return $tags
+}
+
+function Convert-Tag-To-Path {
+    param(
+        [string]$tag
+    )
+    
+    # Convert hierarchical tags (Tag1/subtag/tag) to folder path
+    $path = $tag -replace '/', '\'
+    
+    # Clean up path components to be filesystem-safe
+    $pathParts = $path -split '\\' | ForEach-Object {
+        $part = $_.Trim()
+        # Remove or replace invalid filesystem characters
+        $part = $part -replace '[<>:"|?*]', '-'
+        $part = $part -replace '[\s]+', ' '  # Normalize spaces
+        return $part
+    } | Where-Object { $_ }
+    
+    return $pathParts -join '\'
+}
+
+function Create-Folder-Structure-From-Tags {
+    param(
+        [string]$inputDir,
+        [string]$outputDir
+    )
+    
+    if ($DirectoryType -eq 'Logseq') {
+        Write-Host "--- Creating folder structure from tags (Logseq mode)... ---"
+    } else {
+        Write-Host "--- Creating folder structure preserving original hierarchy (Other mode)... ---"
+    }
+    
+    # Get all files to process
+    $extensions = @('.md', '.org')
+    if ($DirectoryType -eq 'Other') {
+        $extensions += @('.docx', '.odt')
+    }
+    $files = Get-ChildItem -Path $inputDir -Recurse -File | Where-Object { $_.Extension -in $extensions }
+    
+    $processedFiles = 0
+    $totalFiles = $files.Count
+    
+    foreach ($file in $files) {
+        $processedFiles++
+        Write-Host "Processing [$processedFiles/$totalFiles]: $($file.Name)"
+        
+        try {
+            # Read file content
+            $content = Get-Content $file.FullName -Raw -Encoding UTF8
+            
+            # Determine output path based on directory type
+            if ($DirectoryType -eq 'Logseq') {
+                # Extract tags from content and organize by tags
+                $tags = Extract-Tags-From-Content -content $content
+                
+                if ($tags.Count -eq 0) {
+                    # No tags found, place in root of output directory
+                    $outputPath = Join-Path $outputDir "$($file.BaseName).md"
+                } else {
+                    # Use the first tag to determine folder structure
+                    $primaryTag = $tags[0]
+                    $folderPath = Convert-Tag-To-Path -tag $primaryTag
+                    $fullOutputDir = Join-Path $outputDir $folderPath
+                    
+                    # Create directory if it doesn't exist
+                    if (-not (Test-Path $fullOutputDir)) {
+                        New-Item -ItemType Directory -Path $fullOutputDir -Force | Out-Null
+                    }
+                    
+                    $outputPath = Join-Path $fullOutputDir "$($file.BaseName).md"
+                }
+            } else {
+                # Preserve original folder structure for "Other" directory type
+                $relativePath = $file.FullName.Substring($inputDir.Length).TrimStart('\', '/')
+                $relativeDir = [System.IO.Path]::GetDirectoryName($relativePath)
+                
+                if ($relativeDir) {
+                    $fullOutputDir = Join-Path $outputDir $relativeDir
+                    # Create directory if it doesn't exist
+                    if (-not (Test-Path $fullOutputDir)) {
+                        New-Item -ItemType Directory -Path $fullOutputDir -Force | Out-Null
+                    }
+                    $outputPath = Join-Path $fullOutputDir "$($file.BaseName).md"
+                } else {
+                    # File is in root directory
+                    $outputPath = Join-Path $outputDir "$($file.BaseName).md"
+                }
+            }
+            
+            # Process content to resolve Logseq placeholders if it's a Logseq directory
+            if ($DirectoryType -eq 'Logseq') {
+                $processedContent = Resolve-LogseqPlaceholders -text $content -blockMap $blockMap
+            } else {
+                $processedContent = $content
+            }
+            
+            # Convert to markdown if it's not already markdown
+            if ($file.Extension.ToLower() -eq '.org') {
+                $tempOrgFile = [System.IO.Path]::GetTempFileName()
+                $tempMdFile = [System.IO.Path]::GetTempFileName()
+                
+                try {
+                    Set-Content -Path $tempOrgFile -Value $processedContent -Encoding UTF8
+                    & pandoc $tempOrgFile -f org -t markdown --wrap=none -o $tempMdFile
+                    
+                    if ($LASTEXITCODE -eq 0) {
+                        $processedContent = Get-Content $tempMdFile -Raw -Encoding UTF8
+                    } else {
+                        Write-Warning "Failed to convert org file: $($file.Name)"
+                        $processedContent = $content  # Fallback to original content
+                    }
+                } finally {
+                    Remove-Item $tempOrgFile -Force -ErrorAction SilentlyContinue
+                    Remove-Item $tempMdFile -Force -ErrorAction SilentlyContinue
+                }
+            } elseif ($file.Extension.ToLower() -in @('.docx', '.odt')) {
+                # Convert Office documents to markdown
+                $tempMdFile = [System.IO.Path]::GetTempFileName()
+                
+                try {
+                    $fromFormat = if ($file.Extension.ToLower() -eq '.docx') { 'docx' } else { 'odt' }
+                    & pandoc $file.FullName -f $fromFormat -t markdown --wrap=none -o $tempMdFile
+                    
+                    if ($LASTEXITCODE -eq 0) {
+                        $processedContent = Get-Content $tempMdFile -Raw -Encoding UTF8
+                    } else {
+                        Write-Warning "Failed to convert $($file.Extension) file: $($file.Name)"
+                        continue  # Skip this file if conversion fails
+                    }
+                } finally {
+                    Remove-Item $tempMdFile -Force -ErrorAction SilentlyContinue
+                }
+            }
+            
+            # Write the processed content to the output file
+            Set-Content -Path $outputPath -Value $processedContent -Encoding UTF8
+            
+            Write-Host "  → Created: $($outputPath.Substring($outputDir.Length + 1))" -ForegroundColor Green
+            
+        } catch {
+            Write-Warning "Error processing $($file.Name): $_"
+        }
+    }
+    
+    Write-Host "`n=== Folder Structure Creation Summary ===" -ForegroundColor Cyan
+    Write-Host "Total files processed: $totalFiles" -ForegroundColor White
+    Write-Host "Output directory: $outputDir" -ForegroundColor White
+    if ($DirectoryType -eq 'Logseq') {
+        Write-Host "Organization: Files organized by tags" -ForegroundColor White
+    } else {
+        Write-Host "Organization: Original folder structure preserved" -ForegroundColor White
+    }
+    Write-Host ""
+}
 
 function Index-Logseq-Content {
     param(
@@ -391,7 +614,34 @@ if ($DirectoryType -eq 'Logseq') {
     Index-Logseq-Content -LogseqDir $InputDir -pageMap $pageMap -blockMap $blockMap
 }
 
-# --- Process files ---
+# --- Choose processing mode based on parameters ---
+if ($CreateFolderStructure) {
+    # Create folder structure from tags instead of ENEX
+    Write-Host ""
+    Write-Host "=== Creating Folder Structure from Tags ===" -ForegroundColor Cyan
+    Write-Host ""
+    
+    $outputDir = Join-Path ([System.IO.Path]::GetDirectoryName($outputFile)) "FolderStructure"
+    if (Test-Path $outputDir) {
+        Write-Host "Output directory '$outputDir' already exists. Removing it."
+        Remove-Item -Path $outputDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+    
+    Create-Folder-Structure-From-Tags -inputDir $InputDir -outputDir $outputDir
+    
+    Write-Host ""
+    Write-Host "=== Folder Structure Creation Completed ===" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Output directory: $outputDir" -ForegroundColor White
+    Write-Host ""
+    Write-Host "Files have been organized into folders based on their tags." -ForegroundColor Yellow
+    Write-Host "You can now copy this folder structure to your preferred note-taking application." -ForegroundColor White
+    Write-Host ""
+    exit 0
+}
+
+# --- Process files for ENEX export ---
 $extensions = @('.md', '.org')
 if ($DirectoryType -eq 'Other') {
     $extensions += '.docx', '.odt'
