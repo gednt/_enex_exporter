@@ -8,6 +8,7 @@ This PowerShell script (`LogseqToJoplin-Convert.ps1`) exports notes from any dir
 - **Image Handling:** Extracts and embeds images from Markdown, Org-mode, DOCX, and ODT files, including those extracted by Pandoc.
 - **Pandoc Integration:** Uses [Pandoc](https://pandoc.org/) to convert Markdown, Org-mode, DOCX, and ODT files to HTML for ENEX.
 - **Tag Extraction:** Derives tags from file naming conventions (triple underscores).
+- **Tag Extraction:** Derives tags from file content and file naming conventions. Supports Logseq-style tags written as `#tag` or bracketed `[[Tag]]` forms, including hierarchical tags like `#tag/sub/tag` or `[[Tag/Subtag/Item]]`.
 - **Metadata Preservation:** Preserves creation and modification dates in the ENEX export.
 - **Batch Processing:** Processes all supported files in the directory tree.
 
@@ -42,6 +43,9 @@ This PowerShell script (`LogseqToJoplin-Convert.ps1`) exports notes from any dir
 
    Modes when using `-CreateFolderStructure`:
    - Logseq mode (`-DirectoryType Logseq`): files are organized into folders derived from their tags. Hierarchical tags like `[[Project/Subtask/Item]]` will create nested folders (`Project\Subtask\Item\note.md`). Logseq block references and embeds are resolved.
+      - Logseq mode (`-DirectoryType Logseq`): files are organized into folders derived from their tags. Hierarchical tags like `[[Project/Subtask/Item]]` or `#project/subtask/item` will create nested folders (`Project\Subtask\Item\note.md`). Files are written at the deepest-level folder for each tag found.
+         - Bracketed links `[[...]]` are treated as tags only when they are hierarchical (contain `/`) or are a single token with no whitespace. This avoids treating typical page links like `[[Some Page Name]]` as tags. If you prefer every `[[...]]` treated as a tag, the script can be adjusted.
+         - When a file has multiple tags, the script will write the file into each corresponding tag folder (i.e., duplicate the file across tag folders). Existing files with the same name are suffixed (e.g., `_1`) to avoid overwriting if contents differ.
    - Other mode (`-DirectoryType Other`): the script preserves the input directory's folder hierarchy and converts supported files in-place to Markdown files under the output folder. For example, `InputDir\FolderA\Note.docx` becomes `OutputFolder\FolderA\Note.md` after conversion.
 
 4. **Import into Joplin or Evernote:**
@@ -54,7 +58,7 @@ This PowerShell script (`LogseqToJoplin-Convert.ps1`) exports notes from any dir
 
 - **Folder Structure (when using `-CreateFolderStructure`):**
    - The script creates an output folder named `FolderStructure` next to the generated ENEX file (or next to your `InputDir` when used). Inside it:
-      - In Logseq mode, files are placed in folders derived from their tags (hierarchical tags create nested folders).
+      - In Logseq mode, files are placed in folders derived from their tags (hierarchical tags create nested folders). Files are placed at the deepest level of the tag path.
       - In Other mode, the original folder hierarchy from the input directory is recreated and files are converted to Markdown while preserving relative paths.
    - Filenames are sanitized for filesystem compatibility and all converted files are UTF-8 encoded.
 
@@ -62,6 +66,12 @@ This PowerShell script (`LogseqToJoplin-Convert.ps1`) exports notes from any dir
 - Only Markdown (`.md`), Org-mode (`.org`), DOCX (`.docx`), and ODT (`.odt`) files are supported.
 - Requires Pandoc for conversion.
 - Some advanced Logseq or document features may not be fully supported.
+
+Additional notes and caveats:
+- Bracket link heuristic: `[[...]]` with spaces is assumed to be a page link and is not treated as a tag. `[[singleword]]` and `[[a/b/c]]` are treated as tags. This behavior reduces false positives for page links but may be changed if you want different behavior.
+- Files that contain multiple tags will be duplicated under each matching tag folder. If you prefer a different strategy (e.g., only the first tag, or creating shortcuts), update the script or request a change.
+- Asset handling remains unchanged: per-file `assets` folders are created when images/media are found and links are rewritten to local `assets/...` paths.
+- Tags and folder names are sanitized for filesystem compatibility (invalid characters are replaced) and spaces are normalized.
 
 Notes:
 - When using `-CreateFolderStructure` in Other mode, office documents (`.docx`, `.odt`) are converted to Markdown using Pandoc and the converted Markdown is written in the matching output location.
