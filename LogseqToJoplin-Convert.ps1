@@ -27,10 +27,20 @@ function Extract-Tags-From-Content {
     $bracketTagPattern = '\[\[([^\]]+)\]\]'
     $bracketMatches = [regex]::Matches($content, $bracketTagPattern)
     foreach ($match in $bracketMatches) {
-        $tag = $match.Groups[1].Value.Trim()
-        if ($tag -and $tag -notin $tags) {
-            $tags += $tag
+        $raw = $match.Groups[1].Value.Trim()
+        # Heuristic: treat [[...]] as a tag only when it's hierarchical (contains '/')
+        # or is a single-token (no whitespace). This avoids treating normal page links like
+        # [[Some Page Name]] as tags. Strip any leading '#' if present.
+        if (-not $raw) { continue }
+        if ($raw -match '/') {
+            $tag = $raw
+        } elseif (-not ($raw -match '\s')) {
+            $tag = $raw
+        } else {
+            continue
         }
+        $tag = $tag.TrimStart('#').Trim()
+        if ($tag -and $tag -notin $tags) { $tags += $tag }
     }
     
     # Extract #hashtag style tags (including hierarchical ones like #tag1/subtag/tag)
@@ -101,6 +111,141 @@ function Convert-Tag-To-Path {
     return $pathParts -join '\'
 }
 
+function Fix-Asset-References {
+    param(
+        [string]$content,
+        [string]$sourceDir,
+        [string]$destDir,
+        [string]$outputDir,
+        [string]$top,
+        [string]$extractedMediaDir
+    )
+
+    # Destination assets folder for this specific file (per-file assets)
+    $destAssets = Join-Path $destDir 'assets'
+
+    # Helper to compute relative path from one dir to target
+    function Get-Relative([string]$fromDir, [string]$toPath) {
+        try {
+            $from = (Resolve-Path $fromDir).ProviderPath
+            $to = (Resolve-Path $toPath).ProviderPath
+            $fromUri = New-Object System.Uri($from + [System.IO.Path]::DirectorySeparatorChar)
+            $toUri = New-Object System.Uri($to)
+            $rel = $fromUri.MakeRelativeUri($toUri).ToString()
+            $rel = [System.Uri]::UnescapeDataString($rel)
+            return $rel -replace '/','\\'
+        } catch {
+            return $toPath
+        }
+    }
+
+    # Resolve a referenced url/path to a new relative path from destDir
+    function Resolve-NewUrl([string]$url) {
+        if (-not $url) { return $url }
+        $u = $url.Trim()
+        if ($u -match '^(https?:\\/\\/|file:|\\/|[A-Za-z]:\\)') { return $u }
+
+        # Normalize leading ./
+        $candidate = $u -replace '^[\\./]+',''
+
+        # Candidate absolute path relative to sourceDir
+        $abs = $candidate
+        if (-not [System.IO.Path]::IsPathRooted($abs)) { $abs = Join-Path $sourceDir $candidate }
+
+        $fileName = [System.IO.Path]::GetFileName($candidate)
+
+        # Priority: extractedMediaDir (from pandoc) -> sourceDir (relative to page) -> input assets under source tree -> search outputDir
+        $sourceMatch = $null
+        if ($extractedMediaDir -and (Test-Path $extractedMediaDir)) {
+            $sourceMatch = Get-ChildItem -Path $extractedMediaDir -Recurse -File -Filter $fileName -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($sourceMatch) { $abs = $sourceMatch.FullName }
+        }
+        if (-not $sourceMatch -and (Test-Path $abs)) { $sourceMatch = Get-Item -Path $abs -ErrorAction SilentlyContinue }
+        if (-not $sourceMatch) {
+            # Try to find in original input assets nearby
+            $candidateUnderInput = Get-ChildItem -Path $sourceDir -Recurse -File -Filter $fileName -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($candidateUnderInput) { $sourceMatch = $candidateUnderInput; $abs = $sourceMatch.FullName }
+        }
+        if (-not $sourceMatch) {
+            # Last resort: any file under outputDir with same name (rare but possible)
+            $candidateOut = Get-ChildItem -Path $outputDir -Recurse -File -Filter $fileName -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($candidateOut) { $sourceMatch = $candidateOut; $abs = $sourceMatch.FullName }
+        }
+        if (-not $sourceMatch) { return $u }
+
+        # Ensure destination assets folder exists and copy the asset in (do not overwrite if exists)
+        if (-not (Test-Path $destAssets)) { New-Item -ItemType Directory -Path $destAssets -Force | Out-Null }
+        $destFile = Join-Path $destAssets $fileName
+        if (-not (Test-Path $destFile)) {
+            try { Copy-Item -Path $abs -Destination $destFile -Force -ErrorAction SilentlyContinue } catch { }
+        }
+
+        # Return a consistent local assets path: assets/<url-encoded-filename>
+        $fileNameOnly = [System.IO.Path]::GetFileName($destFile)
+        try {
+            $encoded = [System.Uri]::EscapeDataString($fileNameOnly)
+        } catch { $encoded = $fileNameOnly }
+        return "assets/$encoded"
+    }
+
+    $fixed = $content
+
+    # Markdown links/images: capture optional leading '!' (image), alt text and url
+    $mdPattern = '(\\?)(?<bang>!?)\[(?<alt>[^\]]*)\]\((?<url>[^)]+)\)'
+    $fixed = [regex]::Replace($fixed, $mdPattern, {
+        param($m)
+        # $m.Groups[1] is the optional backslash before bang, we want to skip it (remove it)
+        $bang = $m.Groups['bang'].Value
+        $alt = $m.Groups['alt'].Value
+        $url = $m.Groups['url'].Value
+
+        # Clean alt text: remove stray backslashes used for escaping and trim
+        $cleanAlt = $alt -replace '\\',''
+        $cleanAlt = $cleanAlt.Trim()
+
+        $newUrl = Resolve-NewUrl $url
+        return "$bang[$cleanAlt]($newUrl)"
+    })
+
+    # HTML img src
+    $imgPattern = '<img\s+[^>]*src\s*=\s*["''](?<url>[^"'']+)["''][^>]*>'
+    $fixed = [regex]::Replace($fixed, $imgPattern, {
+        param($m)
+        $url = $m.Groups['url'].Value
+        $newUrl = Resolve-NewUrl $url
+        return ($m.Value -replace [regex]::Escape($url), [System.Text.RegularExpressions.Regex]::Escape($newUrl)) -replace '\\Q','' -replace '\\E',''
+    })
+
+    # Logseq/wiki image links: ![[...]]
+    $wikiImgPattern = '!\[\[([^\]]+)\]\]'
+    $fixed = [regex]::Replace($fixed, $wikiImgPattern, {
+        param($m)
+        $inner = $m.Groups[1].Value
+        $newInner = Resolve-NewUrl $inner
+        return "![[${newInner}]]"
+    })
+
+    # Wiki links that point to assets
+    $wikiLinkPattern = '\[\[([^\]]+)\]\]'
+    $fixed = [regex]::Replace($fixed, $wikiLinkPattern, {
+        param($m)
+        $inner = $m.Groups[1].Value
+        if ($inner -match '(?i)assets[\\/]|\.(png|jpg|jpeg|gif|svg|webp|bmp)$') {
+            $newInner = Resolve-NewUrl $inner
+            return "[[${newInner}]]"
+        }
+        return $m.Value
+    })
+
+    # Cleanup: remove any escaping backslash that was left before image tokens (e.g. \![...])
+    try {
+        $fixed = $fixed -replace '\\\\!\\\[\\\[', '![['    # \![[ -> ![[
+        $fixed = $fixed -replace '\\\\!\\\[', '!['          # \![ -> ![
+    } catch { }
+
+    return $fixed
+}
+
 function Create-Folder-Structure-From-Tags {
     param(
         [string]$inputDir,
@@ -120,111 +265,194 @@ function Create-Folder-Structure-From-Tags {
     }
     $files = Get-ChildItem -Path $inputDir -Recurse -File | Where-Object { $_.Extension -in $extensions }
     
+    # Copy any 'assets' directories found under input to the corresponding top-level output folder
+    try {
+        $assetDirs = Get-ChildItem -Path $inputDir -Recurse -Directory | Where-Object { $_.Name -ieq 'assets' }
+        foreach ($ad in $assetDirs) {
+            $rel = $ad.FullName.Substring($inputDir.Length).TrimStart('\', '/')
+            $parts = $rel -split '[\\/]'
+            $top = if ($parts.Length -gt 1) { $parts[0] } else { '' }
+            $destBase = if ($top -and $top -ne '') { Join-Path $outputDir $top } else { $outputDir }
+            $destAssets = Join-Path $destBase 'assets'
+
+            # Recreate destination assets folder (clean copy)
+            if (Test-Path $destAssets) { Remove-Item -Path $destAssets -Recurse -Force -ErrorAction SilentlyContinue }
+            New-Item -ItemType Directory -Path $destAssets -Force | Out-Null
+
+            # Copy contents preserving original formats (don't convert)
+            $sourcePattern = Join-Path $ad.FullName '*'
+            Copy-Item -Path $sourcePattern -Destination $destAssets -Recurse -Force -ErrorAction SilentlyContinue
+
+            Write-Host "Copied assets: $($ad.FullName) -> $($destAssets.Substring($outputDir.Length + 1))"
+        }
+    } catch {
+        Write-Warning "Failed to copy assets folders: $_"
+    }
+
     $processedFiles = 0
     $totalFiles = $files.Count
-    
-    foreach ($file in $files) {
-        $processedFiles++
-        Write-Host "Processing [$processedFiles/$totalFiles]: $($file.Name)"
-        
-        try {
-            # Read file content
-            $content = Get-Content $file.FullName -Raw -Encoding UTF8
-            
-            # Determine output path based on directory type
-            if ($DirectoryType -eq 'Logseq') {
-                # Extract tags from content and organize by tags
-                $tags = Extract-Tags-From-Content -content $content
-                
-                if ($tags.Count -eq 0) {
-                    # No tags found, place in root of output directory
-                    $outputPath = Join-Path $outputDir "$($file.BaseName).md"
-                } else {
-                    # Use the first tag to determine folder structure
-                    $primaryTag = $tags[0]
-                    $folderPath = Convert-Tag-To-Path -tag $primaryTag
-                    $fullOutputDir = Join-Path $outputDir $folderPath
-                    
-                    # Create directory if it doesn't exist
-                    if (-not (Test-Path $fullOutputDir)) {
-                        New-Item -ItemType Directory -Path $fullOutputDir -Force | Out-Null
-                    }
-                    
-                    $outputPath = Join-Path $fullOutputDir "$($file.BaseName).md"
+
+    if ($DirectoryType -eq 'Logseq') {
+        # First pass: build map of top-level input folders -> tags used under them
+        $topTagMap = @{}
+        foreach ($file in $files) {
+            try {
+                $relativePath = $file.FullName.Substring($inputDir.Length).TrimStart('\', '/')
+                $parts = $relativePath -split '[\\/]'
+                $top = if ($parts.Length -gt 1) { $parts[0] } else { '' }
+
+                $content = Get-Content $file.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                if ($content) {
+                    $tags = Extract-Tags-From-Content -content $content
+                    if (-not $topTagMap.ContainsKey($top)) { $topTagMap[$top] = [System.Collections.Generic.HashSet[string]]::new() }
+                    foreach ($t in $tags) { $topTagMap[$top].Add($t) | Out-Null }
                 }
-            } else {
-                # Preserve original folder structure for "Other" directory type
+            } catch { }
+        }
+
+        # Create tag folders under each top-level root (or root when top is empty)
+        foreach ($top in $topTagMap.Keys) {
+            foreach ($t in $topTagMap[$top]) {
+                $folderPath = Convert-Tag-To-Path -tag $t
+                $base = if ($top -and $top -ne '') { Join-Path $outputDir $top } else { $outputDir }
+                $fullFolder = if ($folderPath -and $folderPath -ne '') { Join-Path $base $folderPath } else { $base }
+                if (-not (Test-Path $fullFolder)) {
+                    New-Item -ItemType Directory -Path $fullFolder -Force | Out-Null
+                    $display = if ($base.Length -lt $outputDir.Length) { $fullFolder } else { $fullFolder.Substring($outputDir.Length + 1) }
+                    Write-Host "Created tag folder: $($fullFolder.Substring($outputDir.Length + 1))"
+                }
+            }
+        }
+
+        # Second pass: write files into their corresponding top/tag folders (bottom level)
+        foreach ($file in $files) {
+            $processedFiles++
+            Write-Host "Processing [$processedFiles/$totalFiles]: $($file.Name)"
+            try {
+                $relativePath = $file.FullName.Substring($inputDir.Length).TrimStart('\', '/')
+                $parts = $relativePath -split '[\\/]'
+                $top = if ($parts.Length -gt 1) { $parts[0] } else { '' }
+
+                $content = Get-Content $file.FullName -Raw -Encoding UTF8
+                $tags = Extract-Tags-From-Content -content $content
+
+                # Resolve placeholders for Logseq
+                $processedContent = Resolve-LogseqPlaceholders -text $content -blockMap $blockMap
+
+                # Convert format if needed (org -> md) and extract media so we can copy referenced files into per-file assets
+                $extractedMediaDir = $null
+                if ($file.Extension.ToLower() -eq '.org') {
+                    $tmpOrg = [System.IO.Path]::GetTempFileName()
+                    $tmpMd = [System.IO.Path]::GetTempFileName()
+                    $mediaDir = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ([System.IO.Path]::GetRandomFileName())
+                    try {
+                        New-Item -ItemType Directory -Path $mediaDir | Out-Null
+                        Set-Content -Path $tmpOrg -Value $processedContent -Encoding UTF8
+                        & pandoc $tmpOrg -f org -t markdown --wrap=none --extract-media="$mediaDir" -o $tmpMd
+                        if ($LASTEXITCODE -eq 0) { $processedContent = Get-Content $tmpMd -Raw -Encoding UTF8; $extractedMediaDir = $mediaDir }
+                    } finally {
+                        Remove-Item $tmpOrg -Force -ErrorAction SilentlyContinue
+                        Remove-Item $tmpMd -Force -ErrorAction SilentlyContinue
+                        # Do not remove $mediaDir here; we'll use it when copying assets per file and remove later
+                    }
+                }
+
+                if ($tags.Count -eq 0) {
+                    $destBase = if ($top -and $top -ne '') { Join-Path $outputDir $top } else { $outputDir }
+                    if (-not (Test-Path $destBase)) { New-Item -ItemType Directory -Path $destBase -Force | Out-Null }
+                    $outPath = Join-Path $destBase "$($file.BaseName).md"
+                    # Fix asset links so they point to the per-file assets folder; pass extractedMediaDir when available
+                    $fixedContent = Fix-Asset-References -content $processedContent -sourceDir $file.DirectoryName -destDir (Split-Path -Parent $outPath) -outputDir $outputDir -top $top -extractedMediaDir $extractedMediaDir
+                    Set-Content -Path $outPath -Value $fixedContent -Encoding UTF8
+                    Write-Host "  → Created: $($outPath.Substring($outputDir.Length + 1))" -ForegroundColor Green
+                } else {
+                    foreach ($t in $tags) {
+                        $folderPath = Convert-Tag-To-Path -tag $t
+                        $destBase = if ($top -and $top -ne '') { Join-Path $outputDir $top } else { $outputDir }
+                        $destDir = if ($folderPath -and $folderPath -ne '') { Join-Path $destBase $folderPath } else { $destBase }
+                        if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+                        $outPath = Join-Path $destDir "$($file.BaseName).md"
+                        if (Test-Path $outPath) {
+                            $existing = Get-Content $outPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                            if ($existing -ne $processedContent) {
+                                $suffix = 1
+                                do { $candidate = Join-Path $destDir ("$($file.BaseName)_$suffix.md"); $suffix++ } while (Test-Path $candidate)
+                                $outPath = $candidate
+                            }
+                        }
+                        # Fix asset links for files placed under tag folders; pass extractedMediaDir when available
+                        $fixedContent = Fix-Asset-References -content $processedContent -sourceDir $file.DirectoryName -destDir $destDir -outputDir $outputDir -top $top -extractedMediaDir $extractedMediaDir
+                        Set-Content -Path $outPath -Value $fixedContent -Encoding UTF8
+                        Write-Host "  → Created: $($outPath.Substring($outputDir.Length + 1))" -ForegroundColor Green
+                    }
+                }
+                # Cleanup extracted media directory for this file if it exists
+                if ($extractedMediaDir -and (Test-Path $extractedMediaDir)) {
+                    try { Remove-Item -Path $extractedMediaDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+                }
+            } catch {
+                Write-Warning "Error processing $($file.Name): $_"
+            }
+        }
+
+    } else {
+        # Other mode: preserve original folder structure (existing behavior)
+        foreach ($file in $files) {
+            $processedFiles++
+            Write-Host "Processing [$processedFiles/$totalFiles]: $($file.Name)"
+            try {
+                $content = Get-Content $file.FullName -Raw -Encoding UTF8
                 $relativePath = $file.FullName.Substring($inputDir.Length).TrimStart('\', '/')
                 $relativeDir = [System.IO.Path]::GetDirectoryName($relativePath)
-                
                 if ($relativeDir) {
                     $fullOutputDir = Join-Path $outputDir $relativeDir
-                    # Create directory if it doesn't exist
-                    if (-not (Test-Path $fullOutputDir)) {
-                        New-Item -ItemType Directory -Path $fullOutputDir -Force | Out-Null
-                    }
+                    if (-not (Test-Path $fullOutputDir)) { New-Item -ItemType Directory -Path $fullOutputDir -Force | Out-Null }
                     $outputPath = Join-Path $fullOutputDir "$($file.BaseName).md"
                 } else {
-                    # File is in root directory
                     $outputPath = Join-Path $outputDir "$($file.BaseName).md"
                 }
-            }
-            
-            # Process content to resolve Logseq placeholders if it's a Logseq directory
-            if ($DirectoryType -eq 'Logseq') {
-                $processedContent = Resolve-LogseqPlaceholders -text $content -blockMap $blockMap
-            } else {
-                $processedContent = $content
-            }
-            
-            # Convert to markdown if it's not already markdown
-            if ($file.Extension.ToLower() -eq '.org') {
-                $tempOrgFile = [System.IO.Path]::GetTempFileName()
-                $tempMdFile = [System.IO.Path]::GetTempFileName()
-                
-                try {
-                    Set-Content -Path $tempOrgFile -Value $processedContent -Encoding UTF8
-                    & pandoc $tempOrgFile -f org -t markdown --wrap=none -o $tempMdFile
-                    
-                    if ($LASTEXITCODE -eq 0) {
-                        $processedContent = Get-Content $tempMdFile -Raw -Encoding UTF8
-                    } else {
-                        Write-Warning "Failed to convert org file: $($file.Name)"
-                        $processedContent = $content  # Fallback to original content
-                    }
-                } finally {
-                    Remove-Item $tempOrgFile -Force -ErrorAction SilentlyContinue
-                    Remove-Item $tempMdFile -Force -ErrorAction SilentlyContinue
+
+                # Convert formats if needed
+                if ($file.Extension.ToLower() -eq '.org') {
+                    $tmpOrg = [System.IO.Path]::GetTempFileName()
+                    $tmpMd = [System.IO.Path]::GetTempFileName()
+                    try {
+                        Set-Content -Path $tmpOrg -Value $content -Encoding UTF8
+                        & pandoc $tmpOrg -f org -t markdown --wrap=none -o $tmpMd
+                        if ($LASTEXITCODE -eq 0) { $content = Get-Content $tmpMd -Raw -Encoding UTF8 } else { Write-Warning "Failed to convert org file: $($file.Name)" }
+                    } finally { Remove-Item $tmpOrg -Force -ErrorAction SilentlyContinue; Remove-Item $tmpMd -Force -ErrorAction SilentlyContinue }
+                } elseif ($file.Extension.ToLower() -in @('.docx', '.odt')) {
+                    $tmpMd = [System.IO.Path]::GetTempFileName()
+                    try {
+                        $fromFormat = if ($file.Extension.ToLower() -eq '.docx') { 'docx' } else { 'odt' }
+                        & pandoc $file.FullName -f $fromFormat -t markdown --wrap=none -o $tmpMd
+                        if ($LASTEXITCODE -eq 0) { $content = Get-Content $tmpMd -Raw -Encoding UTF8 } else { Write-Warning "Failed to convert $($file.Extension) file: $($file.Name)"; continue }
+                    } finally { Remove-Item $tmpMd -Force -ErrorAction SilentlyContinue }
                 }
-            } elseif ($file.Extension.ToLower() -in @('.docx', '.odt')) {
-                # Convert Office documents to markdown
-                $tempMdFile = [System.IO.Path]::GetTempFileName()
-                
-                try {
-                    $fromFormat = if ($file.Extension.ToLower() -eq '.docx') { 'docx' } else { 'odt' }
-                    & pandoc $file.FullName -f $fromFormat -t markdown --wrap=none -o $tempMdFile
-                    
-                    if ($LASTEXITCODE -eq 0) {
-                        $processedContent = Get-Content $tempMdFile -Raw -Encoding UTF8
-                    } else {
-                        Write-Warning "Failed to convert $($file.Extension) file: $($file.Name)"
-                        continue  # Skip this file if conversion fails
-                    }
-                } finally {
-                    Remove-Item $tempMdFile -Force -ErrorAction SilentlyContinue
-                }
+
+                Set-Content -Path $outputPath -Value $content -Encoding UTF8
+                Write-Host "  → Created: $($outputPath.Substring($outputDir.Length + 1))" -ForegroundColor Green
+            } catch {
+                Write-Warning "Error processing $($file.Name): $_"
             }
-            
-            # Write the processed content to the output file
-            Set-Content -Path $outputPath -Value $processedContent -Encoding UTF8
-            
-            Write-Host "  → Created: $($outputPath.Substring($outputDir.Length + 1))" -ForegroundColor Green
-            
-        } catch {
-            Write-Warning "Error processing $($file.Name): $_"
         }
     }
     
+    # Cleanup: remove any empty directories left behind (deepest first)
+    try {
+        $dirs = Get-ChildItem -Path $outputDir -Recurse -Directory -Force | Sort-Object FullName -Descending
+        foreach ($d in $dirs) {
+            # If directory contains no files (ignoring hidden/system), remove it
+            $fileCount = (Get-ChildItem -Path $d.FullName -File -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+            if ($fileCount -eq 0) {
+                Remove-Item -Path $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "Removed empty folder: $($d.FullName.Substring($outputDir.Length + 1))"
+            }
+        }
+    } catch {
+        Write-Warning "Failed during cleanup of empty directories: $_"
+    }
+
     Write-Host "`n=== Folder Structure Creation Summary ===" -ForegroundColor Cyan
     Write-Host "Total files processed: $totalFiles" -ForegroundColor White
     Write-Host "Output directory: $outputDir" -ForegroundColor White
@@ -403,7 +631,7 @@ function Resolve-LogseqPlaceholders {
     
     # Then resolve regular block references ((block-id))
     $blockRefPattern = '\(\(([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\)\)'
-    $maxDepth = 10
+    $maxDepth = 30
     $currentDepth = 0
     
     while ($currentDepth -lt $maxDepth) {
@@ -620,7 +848,7 @@ if ($CreateFolderStructure) {
     Write-Host ""
     Write-Host "=== Creating Folder Structure from Tags ===" -ForegroundColor Cyan
     Write-Host ""
-    
+
     $outputDir = Join-Path ([System.IO.Path]::GetDirectoryName($outputFile)) "FolderStructure"
     if (Test-Path $outputDir) {
         Write-Host "Output directory '$outputDir' already exists. Removing it."
@@ -629,7 +857,10 @@ if ($CreateFolderStructure) {
     New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
     
     Create-Folder-Structure-From-Tags -inputDir $InputDir -outputDir $outputDir
-    
+    #Removes the assets folder in the top folder created
+    #Removes the files in the assets folder
+    #FolderStructure\assets
+    Remove-Item -Path (Join-Path -Path $outputDir -ChildPath "assets") -Recurse -Force  
     Write-Host ""
     Write-Host "=== Folder Structure Creation Completed ===" -ForegroundColor Green
     Write-Host ""
@@ -738,6 +969,8 @@ foreach ($file in $files) {
 
 # --- End ENEX file ---
 Add-Content -Path $outputFile -Value "</en-export>" -Encoding UTF8
+
+
 
 Write-Host "`n=== Evernote ENEX Export Summary ==="
 Write-Host "Total files processed: $total"
